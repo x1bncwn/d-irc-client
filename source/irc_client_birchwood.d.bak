@@ -1,0 +1,634 @@
+// source/irc_client.d
+module irc_client;
+
+import birchwood.client;
+import birchwood.config;
+import birchwood.protocol;
+import std.concurrency;
+import std.string;
+import std.conv;
+import std.datetime;
+import core.thread;
+import core.time;
+import models;
+import logging;
+import std.algorithm;
+
+// Helper function to escape pipes and backslashes for transport
+private string escapeForTransport(string text) {
+    string result;
+    foreach (char c; text) {
+        if (c == '|') {
+            result ~= "\\|";
+        } else if (c == '\\') {
+            result ~= "\\\\";
+        } else {
+            result ~= c;
+        }
+    }
+    return result;
+}
+
+class MyIRCClient : Client {
+    Tid gtkTid;
+    string serverName;
+    bool clientRunning = true;
+
+    // Buffer for multi-line responses like WHOIS
+    private string whoisBuffer;
+    private bool inWhoisResponse;
+
+    // Track user modes in channels: channel[string] -> nickname[string] -> mode[char]
+    private char[string][string] channelUserModes;
+
+    // Track if we've already requested NAMES for a channel
+    private bool[string] requestedNames;
+
+    this(string server, Tid gtkTid) {
+        auto connInfo = ConnectionInfo.newConnection(
+            server,
+            6667,
+            DEFAULT_NICK,
+            DEFAULT_NICK,
+            "D IRC Client"
+        );
+
+        super(connInfo);
+        this.gtkTid = gtkTid;
+        serverName = server;
+        whoisBuffer = "";
+        inWhoisResponse = false;
+        channelUserModes = null;
+        requestedNames = null;
+
+        logToTerminal("MyIRCClient created for " ~ server, "INFO", "irc");
+    }
+
+    private void sendToGTK(string msgType, string channel, string text, string action = "") {
+        string message;
+        if (action.length > 0) {
+            message = msgType ~ "|" ~ serverName ~ "|" ~ channel ~ "|" ~ action ~ "|" ~ escapeForTransport(text);
+        } else {
+            message = msgType ~ "|" ~ serverName ~ "|" ~ channel ~ "||" ~ escapeForTransport(text);
+        }
+        send(gtkTid, PipeMessage(message));
+        logToTerminal("Sent to GTK: " ~ message, "DEBUG", "irc");
+    }
+
+    private string getNickWithMode(string channel, string nickname) {
+        // Get mode for this user in this channel
+        if (channel in channelUserModes && nickname in channelUserModes[channel]) {
+            char mode = channelUserModes[channel][nickname];
+            if (mode != 0) {
+                return to!string(mode) ~ nickname;
+            }
+        }
+        return nickname;
+    }
+
+    private void updateUserMode(string channel, string userWithMode) {
+        if (userWithMode.length == 0) return;
+
+        char mode = 0;
+        string nickname = userWithMode;
+
+        // Extract mode symbol if present
+        if (userWithMode[0] == '@' || userWithMode[0] == '+' || userWithMode[0] == '%' ||
+            userWithMode[0] == '&' || userWithMode[0] == '~') {
+            mode = userWithMode[0];
+            nickname = userWithMode[1..$];
+        }
+
+        // Store the mode
+        if (!(channel in channelUserModes)) {
+            channelUserModes[channel] = null;
+        }
+        channelUserModes[channel][nickname] = mode;
+
+        logToTerminal("User " ~ nickname ~ " mode in " ~ channel ~ ": " ~ (mode == 0 ? "none" : to!string(mode)), "DEBUG", "irc");
+    }
+
+    private void clearChannelUsers(string channel) {
+        if (channel in channelUserModes) {
+            channelUserModes[channel] = null;
+        }
+        requestedNames.remove(channel);
+    }
+
+    private void sendChatMessage(string channel, string nickname, string msgBody, bool isAction = false, bool isNotice = false, string customType = "") {
+        // Get current time for timestamp
+        auto now = Clock.currTime();
+        string timeStr = "[" ~ format("%02d:%02d", now.hour, now.minute) ~ "]";
+
+        // Get nickname with mode for this channel
+        string displayNick = nickname.length > 0 ? getNickWithMode(channel, nickname) : nickname;
+
+        // Escape nickname and message for transport
+        string escapedNick = escapeForTransport(displayNick);
+        string escapedMsg = escapeForTransport(msgBody);
+
+        // Send structured message to GTK
+        string msgType;
+        if (customType.length > 0) {
+            msgType = customType;
+        } else {
+            msgType = isAction ? "action" : (isNotice ? "notice" : "message");
+        }
+
+        string message = "chat_msg|" ~ serverName ~ "|" ~ channel ~ "|" ~
+                         timeStr ~ "|" ~ escapedNick ~ "|" ~ msgType ~ "|" ~ escapedMsg;
+        send(gtkTid, PipeMessage(message));
+
+        // Log to terminal
+        string logMsg;
+        if (customType == "system") {
+            logMsg = "[" ~ serverName ~ "] " ~ msgBody;
+        } else if (isAction) {
+            logMsg = "[" ~ channel ~ "] * " ~ displayNick ~ " " ~ msgBody;
+        } else if (isNotice) {
+            logMsg = "[" ~ channel ~ "] -" ~ displayNick ~ "- " ~ msgBody;
+        } else if (customType == "join" || customType == "part" || customType == "quit" ||
+                   customType == "kick" || customType == "nick") {
+            logMsg = "[" ~ channel ~ "] " ~ displayNick ~ " " ~ msgBody;
+        } else {
+            logMsg = "[" ~ channel ~ "] " ~ displayNick ~ ": " ~ msgBody;
+        }
+        logToTerminal(logMsg, "INFO", "irc");
+    }
+
+    override void onChannelMessage(Message fullMessage, string channel, string msgBody) {
+        if (channel.length > 0 && channel[0] == ':') {
+            channel = channel[1..$];
+        }
+
+        string sender = fullMessage.getFrom();
+        string nickname = sender;
+        auto exclamation = sender.indexOf("!");
+        if (exclamation != -1) {
+            nickname = sender[0..exclamation];
+        }
+
+        // Check if it's a CTCP ACTION (/me)
+        bool isAction = false;
+        if (msgBody.length > 0 && msgBody[0] == '\x01' && msgBody.endsWith("\x01")) {
+            if (msgBody.length >= 8 && msgBody[1..8] == "ACTION ") {
+                isAction = true;
+                msgBody = msgBody[8..msgBody.length-1];
+            }
+        }
+
+        sendChatMessage(channel, nickname, msgBody, isAction);
+    }
+
+    override void onDirectMessage(Message fullMessage, string nickname, string msgBody) {
+        // Check if it's a CTCP ACTION (/me)
+        bool isAction = false;
+        if (msgBody.length > 0 && msgBody[0] == '\x01' && msgBody.endsWith("\x01")) {
+            if (msgBody.length >= 8 && msgBody[1..8] == "ACTION ") {
+                isAction = true;
+                msgBody = msgBody[8..msgBody.length-1];
+            }
+        }
+
+        sendChatMessage("", nickname, msgBody, isAction);
+    }
+
+    void onNoticeMessage(Message fullMessage, string target, string msgBody) {
+        string sender = fullMessage.getFrom();
+        string nickname = sender;
+        auto exclamation = sender.indexOf("!");
+        if (exclamation != -1) {
+            nickname = sender[0..exclamation];
+        }
+
+        string channel = target;
+        if (channel.length > 0 && channel[0] == ':') {
+            channel = channel[1..$];
+        }
+
+        sendChatMessage(channel, nickname, msgBody, false, true);
+    }
+
+    override void onGenericCommand(Message message) {
+        string cmd = message.getCommand();
+        string params = message.getParams();
+        string trailing = message.getTrailing();
+
+        if (cmd == "JOIN") {
+            string channel = params;
+            if (channel.length > 0 && channel[0] == ':') {
+                channel = channel[1..$];
+            }
+
+            string sender = message.getFrom();
+            string nickname = sender;
+            auto exclamation = sender.indexOf("!");
+            if (exclamation != -1) {
+                nickname = sender[0..exclamation];
+            }
+
+            logToTerminal(nickname ~ " joined " ~ channel, "INFO", "irc");
+
+            if (nickname == DEFAULT_NICK) {
+                sendChatMessage("", "", "Successfully joined " ~ channel, false, false, "system");
+                sendToGTK("update_channels", channel, "", "join");
+                // Clear previous user list when we join
+                clearChannelUsers(channel);
+                // Request names to get user modes (only if not already requested)
+                if (!(channel in requestedNames)) {
+                    auto namesMessage = new Message("", "NAMES", channel);
+                    this.command(namesMessage);
+                    requestedNames[channel] = true;
+                }
+            } else {
+                sendChatMessage(channel, nickname, "joined the channel", false, false, "join");
+                // Add user with no mode initially
+                updateUserMode(channel, nickname);
+            }
+        }
+        else if (cmd == "PART") {
+            string channel = params;
+            if (channel.length > 0 && channel[0] == ':') {
+                channel = channel[1..$];
+            }
+
+            string sender = message.getFrom();
+            string nickname = sender;
+            auto exclamation = sender.indexOf("!");
+            if (exclamation != -1) {
+                nickname = sender[0..exclamation];
+            }
+
+            string partMsg = trailing.length > 0 ? trailing : "";
+            logToTerminal(nickname ~ " left " ~ channel, "INFO", "irc");
+
+            if (nickname == DEFAULT_NICK) {
+                sendToGTK("update_channels", channel, "", "part");
+                // Clear user list when we leave
+                clearChannelUsers(channel);
+            } else {
+                string msgText = "left the channel";
+                if (partMsg.length > 0) {
+                    msgText ~= " (" ~ partMsg ~ ")";
+                }
+                sendChatMessage(channel, nickname, msgText, false, false, "part");
+                // Remove user from tracking
+                if (channel in channelUserModes && nickname in channelUserModes[channel]) {
+                    channelUserModes[channel].remove(nickname);
+                }
+            }
+        }
+        else if (cmd == "QUIT") {
+            string sender = message.getFrom();
+            string nickname = sender;
+            auto exclamation = sender.indexOf("!");
+            if (exclamation != -1) {
+                nickname = sender[0..exclamation];
+            }
+
+            string quitMsg = trailing.length > 0 ? trailing : "";
+            logToTerminal(nickname ~ " quit: " ~ quitMsg, "INFO", "irc");
+
+            string msgText = "quit";
+            if (quitMsg.length > 0) {
+                msgText ~= ": " ~ quitMsg;
+            }
+            sendChatMessage("", nickname, msgText, false, false, "quit");
+
+            // Remove user from all channels
+            foreach (channel; channelUserModes.keys) {
+                if (nickname in channelUserModes[channel]) {
+                    channelUserModes[channel].remove(nickname);
+                }
+            }
+        }
+        else if (cmd == "NICK") {
+            string sender = message.getFrom();
+            string oldNick = sender;
+            auto exclamation = sender.indexOf("!");
+            if (exclamation != -1) {
+                oldNick = sender[0..exclamation];
+            }
+
+            string newNick = trailing;
+            if (newNick.length > 0 && newNick[0] == ':') {
+                newNick = newNick[1..$];
+            }
+
+            logToTerminal(oldNick ~ " is now known as " ~ newNick, "INFO", "irc");
+
+            // Update nick in all channels
+            foreach (channel; channelUserModes.keys) {
+                if (oldNick in channelUserModes[channel]) {
+                    char mode = channelUserModes[channel][oldNick];
+                    channelUserModes[channel].remove(oldNick);
+                    channelUserModes[channel][newNick] = mode;
+                }
+            }
+
+            sendChatMessage("", oldNick, "is now known as " ~ newNick, false, false, "nick");
+        }
+        else if (cmd == "KICK") {
+            auto parts = params.split(" ");
+            if (parts.length >= 2) {
+                string channel = parts[0];
+                string targetNick = parts[1];
+                string kickMsg = trailing.length > 0 ? trailing : "";
+
+                string sender = message.getFrom();
+                string kickerNick = sender;
+                auto exclamation = sender.indexOf("!");
+                if (exclamation != -1) {
+                    kickerNick = sender[0..exclamation];
+                }
+
+                logToTerminal(targetNick ~ " was kicked from " ~ channel ~ " by " ~ kickerNick, "INFO", "irc");
+
+                string msgText = "was kicked by " ~ kickerNick;
+                if (kickMsg.length > 0) {
+                    msgText ~= " (" ~ kickMsg ~ ")";
+                }
+                sendChatMessage(channel, targetNick, msgText, false, false, "kick");
+
+                // Remove kicked user
+                if (channel in channelUserModes && targetNick in channelUserModes[channel]) {
+                    channelUserModes[channel].remove(targetNick);
+                }
+            }
+        }
+        else if (cmd == "MODE") {
+            auto parts = params.split(" ");
+            if (parts.length >= 2) {
+                string target = parts[0];
+                string modeStr = parts[1];
+
+                // Check if it's a channel mode
+                if (target.length > 0 && target[0] == '#') {
+                    string channel = target;
+
+                    // Parse mode changes like +o nickname or -v nickname
+                    if (parts.length >= 3) {
+                        string targetNick = parts[2];
+                        char modeChar = modeStr[1]; // Get the mode character (o, v, etc.)
+
+                        if (modeStr[0] == '+') {
+                            // Mode added
+                            char displayMode = 0;
+                            switch (modeChar) {
+                                case 'o': displayMode = '@'; break;
+                                case 'v': displayMode = '+'; break;
+                                case 'h': displayMode = '%'; break;
+                                case 'a': displayMode = '&'; break;
+                                case 'q': displayMode = '~'; break;
+                                default: break;
+                            }
+
+                            if (displayMode != 0) {
+                                updateUserMode(channel, to!string(displayMode) ~ targetNick);
+                                logToTerminal(targetNick ~ " got mode " ~ displayMode ~ " in " ~ channel, "DEBUG", "irc");
+                            }
+                        } else if (modeStr[0] == '-') {
+                            // Mode removed
+                            if (channel in channelUserModes && targetNick in channelUserModes[channel]) {
+                                channelUserModes[channel][targetNick] = 0;
+                                logToTerminal(targetNick ~ " lost mode in " ~ channel, "DEBUG", "irc");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    override void onCommandReply(Message commandReply) {
+        string cmd = commandReply.getCommand();
+        string params = commandReply.getParams();
+        string trailing = commandReply.getTrailing();
+
+        try {
+            int replyCode = to!int(cmd);
+
+            if (replyCode == 001) {
+                logToTerminal("Connected to server", "INFO", "irc");
+                sendChatMessage("", "", "Connected to " ~ serverName, false, false, "system");
+            }
+            else if (replyCode == 353) {
+                // RPL_NAMREPLY: Channel users list WITH MODE SYMBOLS
+                auto parts = params.split(" ");
+                if (parts.length >= 3) {
+                    string channel = parts[2];
+                    if (channel.length > 0 && channel[0] == ':') {
+                        channel = channel[1..$];
+                    }
+
+                    // Parse the names list - users come with mode symbols prefixed
+                    auto names = trailing.split(" ");
+                    foreach (nameWithMode; names) {
+                        if (nameWithMode.length > 0) {
+                            updateUserMode(channel, nameWithMode);
+                        }
+                    }
+
+                    // Only log the users list, don't send to chat to avoid duplicates
+                    logToTerminal("Users in " ~ channel ~ ": " ~ trailing, "DEBUG", "irc");
+                    // Don't send to chat - it creates duplicate messages
+                }
+            }
+            else if (replyCode == 366) {
+                // RPL_ENDOFNAMES: End of /NAMES list
+                // Don't send this to chat either
+                logToTerminal("End of /NAMES list", "DEBUG", "irc");
+            }
+            else if (replyCode == 311 || replyCode == 312 || replyCode == 317 ||
+                     replyCode == 318 || replyCode == 319 || replyCode == 301 ||
+                     replyCode == 313 || replyCode == 671 || replyCode == 338) {
+                // WHOIS responses
+                if (!inWhoisResponse) {
+                    inWhoisResponse = true;
+                    whoisBuffer = "";
+                }
+
+                auto allParts = params.split(" ");
+                string targetNick = allParts[1];
+                string displayLine = "";
+
+                if (replyCode == 311) {
+                    string user = allParts[2];
+                    string host = allParts[3];
+                    displayLine = targetNick ~ " is " ~ user ~ "@" ~ host;
+                    if (trailing.length > 0) {
+                        displayLine ~= " (" ~ trailing ~ ")";
+                    }
+                }
+                else if (replyCode == 312) {
+                    string server = allParts[2];
+                    displayLine = targetNick ~ " on " ~ server;
+                    if (trailing.length > 0) {
+                        displayLine ~= " (" ~ trailing ~ ")";
+                    }
+                }
+                else if (replyCode == 317) {
+                    string idleSeconds = allParts[2];
+                    displayLine = targetNick ~ " idle for " ~ idleSeconds ~ " seconds";
+                }
+                else if (replyCode == 319) {
+                    // RPL_WHOISCHANNELS shows channels with mode symbols
+                    displayLine = targetNick ~ " on channels: " ~ trailing;
+
+                    // Parse channels with modes for this user
+                    auto channels = trailing.split(" ");
+                    foreach (channelWithMode; channels) {
+                        if (channelWithMode.length > 1) {
+                            char mode = channelWithMode[0];
+                            string channel = channelWithMode[1..$];
+
+                            // Store this user's mode in this channel
+                            if (!(channel in channelUserModes)) {
+                                channelUserModes[channel] = null;
+                            }
+                            channelUserModes[channel][targetNick] = mode;
+                        }
+                    }
+                }
+                else if (replyCode == 301) {
+                    displayLine = targetNick ~ " is away: " ~ trailing;
+                }
+                else if (replyCode == 313) {
+                    displayLine = targetNick ~ " " ~ trailing;
+                }
+                else if (replyCode == 671) {
+                    displayLine = targetNick ~ " " ~ trailing;
+                }
+                else if (replyCode == 338) {
+                    string ip = allParts[2];
+                    displayLine = targetNick ~ " actually using " ~ ip;
+                }
+
+                whoisBuffer ~= displayLine ~ "\n";
+
+                // 318 is "End of /WHOIS list"
+                if (replyCode == 318) {
+                    sendChatMessage("", "", whoisBuffer, false, false, "system");
+                    whoisBuffer = "";
+                    inWhoisResponse = false;
+                }
+            }
+            else if (replyCode == 321 || replyCode == 322 || replyCode == 323) {
+                // LIST responses
+                if (trailing.length > 0) {
+                    sendChatMessage("", "", trailing, false, false, "system");
+                }
+            }
+            else if (replyCode == 303) {
+                // RPL_ISON: :<nick1> <nick2> ... <nickN>
+                if (trailing.length > 0) {
+                    sendChatMessage("", "", "ISON: " ~ trailing, false, false, "system");
+                }
+            }
+            else {
+                logToTerminal("Server reply " ~ cmd ~ ": " ~ trailing, "DEBUG", "irc");
+                if (trailing.length > 0 && replyCode != 353 && replyCode != 366) {
+                    sendChatMessage("", "", trailing, false, false, "system");
+                }
+            }
+        } catch (Exception e) {
+            logToTerminal("Ignoring unsupported reply code: " ~ cmd, "DEBUG", "irc");
+            if (trailing.length > 0) {
+                sendChatMessage("", "", trailing, false, false, "system");
+            }
+        }
+    }
+
+    override void onConnectionClosed() {
+        logToTerminal("Connection to " ~ serverName ~ " closed", "INFO", "irc");
+        sendToGTK("update_channels", "", "", "failed");
+        clientRunning = false;
+        // Clear all tracked data
+        channelUserModes = null;
+        requestedNames = null;
+    }
+}
+
+void runIrcServer(string server, Tid gtkTid) {
+    logToTerminal("Creating IRC client for " ~ server, "INFO", "irc");
+
+    try {
+        auto client = new MyIRCClient(server, gtkTid);
+        client.connect();
+        logToTerminal("IRC client connected, waiting for commands...", "INFO", "irc");
+
+        bool running = true;
+        while (running && client.clientRunning) {
+            bool gotCommand = false;
+            bool shouldQuit = false;
+            do {
+                gotCommand = receiveTimeout(Duration.zero,
+                    (IRCMessage msg) {
+                        try {
+                            if (msg.type == IRCMessage.Type.Message && msg.text.length > 0) {
+                                if (msg.channel.length > 0 && msg.channel[0] == '#') {
+                                    client.channelMessage(msg.text, msg.channel);
+                                    logToTerminal("Sent to " ~ msg.channel ~ ": " ~ msg.text, "INFO", "irc");
+                                } else if (msg.channel.length > 0 && msg.channel[0] != '#') {
+                                    client.directMessage(msg.text, msg.channel);
+                                    logToTerminal("Sent PM to " ~ msg.channel ~ ": " ~ msg.text, "INFO", "irc");
+                                } else {
+                                    auto spacePos = msg.text.indexOf(" ");
+                                    string command;
+                                    string params;
+                                    if (spacePos != -1) {
+                                        command = msg.text[0..spacePos];
+                                        params = msg.text[spacePos+1..$];
+                                    } else {
+                                        command = msg.text;
+                                        params = "";
+                                    }
+
+                                    auto rawMessage = new Message("", command, params);
+                                    client.command(rawMessage);
+                                    logToTerminal("Sent raw command: " ~ msg.text, "INFO", "irc");
+                                }
+                            } else if (msg.type == IRCMessage.Type.UpdateChannels) {
+                                if (msg.action == "join" && msg.channel.length > 0) {
+                                    client.joinChannel(msg.channel);
+                                    logToTerminal("Joining " ~ msg.channel, "INFO", "irc");
+                                } else if (msg.action == "part" && msg.channel.length > 0) {
+                                    client.leaveChannel(msg.channel);
+                                    logToTerminal("Leaving " ~ msg.channel, "INFO", "irc");
+                                } else if (msg.action == "quit") {
+                                    logToTerminal("Quitting IRC", "INFO", "irc");
+                                    try {
+                                        client.quit();
+                                    } catch (Exception e) {
+                                        logToTerminal("Error during quit: " ~ e.msg, "DEBUG", "irc");
+                                    }
+                                    running = false;
+                                    shouldQuit = true;
+                                }
+                            }
+                        } catch (Exception e) {
+                            logToTerminal("Error: " ~ e.msg, "ERROR", "irc");
+                            send(gtkTid, PipeMessage("message|" ~ server ~ "|||Error: " ~ e.msg));
+                        }
+                        return true;
+                    },
+                    (PipeMessage msg) {
+                        logToTerminal("Received PipeMessage: " ~ msg.data, "DEBUG", "irc");
+                        return true;
+                    }
+                );
+            } while (gotCommand && !shouldQuit);
+
+            if (shouldQuit) {
+                break;
+            }
+
+            Thread.sleep(10.msecs);
+        }
+
+        logToTerminal("IRC client thread exiting", "INFO", "irc");
+    } catch (Exception e) {
+        logToTerminal("Error: " ~ e.msg, "ERROR", "irc");
+        send(gtkTid, PipeMessage("message|" ~ server ~ "|||Connection error: " ~ e.msg));
+    }
+}

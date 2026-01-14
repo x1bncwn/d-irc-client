@@ -1,0 +1,19 @@
+{
+	"name": "d-irc-client",
+	"dependencies": {
+		"birchwood": "~>2.11.0",
+		"gid:gtk4": "~>0.9.7"
+	},
+	"sourceFiles": [
+		"source/app.d",
+		"source/models.d",
+		"source/logging.d",
+		"source/tracker.d",
+		"source/irc_client.d",
+		"source/gtk_client.d"
+	],
+	"targetType": "executable",
+	"versions": [
+		"gtk4"
+	]
+}

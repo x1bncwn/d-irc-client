@@ -1,0 +1,611 @@
+// source/irc_client.d
+module irc_client;
+
+import birchwood.client;
+import birchwood.config;
+import birchwood.protocol;
+import std.concurrency;
+import std.string;
+import std.conv;
+import std.datetime;
+import std.algorithm;
+import std.array;
+import std.stdio;
+import core.thread;
+import core.time;
+import core.sys.posix.unistd : write;
+import core.stdc.errno : errno;
+import models;
+import logging;
+import tracker;
+
+class MyIRCClient : Client {
+    Tid gtkTid;
+    string serverName;
+    bool clientRunning = true;
+    Tracker tracker;
+    int pipeFd;
+
+    private string whoisBuffer;
+    private bool inWhoisResponse;
+
+    this(string server, Tid gtkTid, int pipeFd) {
+        auto connInfo = ConnectionInfo.newConnection(
+            server,
+            6667,
+            defaultNick,
+            defaultNick,
+            "D IRC Client"
+        );
+        super(connInfo);
+        this.gtkTid = gtkTid;
+        this.pipeFd = pipeFd;
+        serverName = server;
+        whoisBuffer = "";
+        inWhoisResponse = false;
+        tracker = new Tracker();
+        tracker.start();
+        
+        logToTerminal("MyIRCClient created for " ~ server ~ " - Tracker started", "INFO", "irc");
+    }
+
+    private void sendToGui(IrcToGtkMessage msg) {
+        logToTerminal("IRC DEBUG: Sending message to GUI thread", "DEBUG", "irc");
+        
+        // Send via std.concurrency
+        send(gtkTid, msg);
+        
+        // Signal pipe with just 1 byte to wake up GUI thread
+        char[1] signalByte = [1];
+        auto result = write(pipeFd, signalByte.ptr, 1);
+        if (result == -1) {
+            logToTerminal("IRC DEBUG: Failed to signal pipe: errno = " ~ to!string(errno), "ERROR", "irc");
+        }
+    }
+
+    private void sendChatMessage(string channel, string rawNickname, string msgBody, bool isAction = false, bool isNotice = false, string customType = "") {
+        auto now = Clock.currTime();
+        string timeStr = "[" ~ format("%02d:%02d", now.hour, now.minute) ~ "]";
+
+        char prefixChar = '\0';
+        string prefixStr = "";
+
+        if (channel.length > 0 && channel[0] == '#') {
+            prefixChar = tracker.getPrefix(channel, rawNickname);
+            if (prefixChar != '\0') {
+                prefixStr = [prefixChar].idup;
+            }
+
+            logToTerminal("IRC DEBUG: Sending chat message - Channel: " ~ channel, "DEBUG", "irc");
+            logToTerminal("IRC DEBUG: Raw nickname: '" ~ rawNickname ~ "'", "DEBUG", "irc");
+            logToTerminal("IRC DEBUG: Prefix from tracker: '" ~ prefixStr ~ "' (char code: " ~ to!string(prefixChar) ~ ", length: " ~ to!string(prefixStr.length) ~ ")", "DEBUG", "irc");
+            if (prefixStr.length > 0) {
+                logToTerminal("IRC DEBUG: Prefix first character: '" ~ [prefixStr[0]] ~ "' (hex: 0x" ~ format("%02x", prefixStr[0]) ~ ")", "DEBUG", "irc");
+            }
+        }
+
+        string messageType = customType.length > 0 ? customType :
+                            (isAction ? "action" : (isNotice ? "notice" : "message"));
+
+        ChatMessage chat = ChatMessage(
+            serverName,
+            channel,
+            timeStr,
+            rawNickname,
+            prefixStr,
+            messageType,
+            msgBody
+        );
+        
+        logToTerminal("IRC DEBUG: ChatMessage struct contents:", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG:   server: " ~ chat.server, "DEBUG", "irc");
+        logToTerminal("IRC DEBUG:   channel: " ~ chat.channel, "DEBUG", "irc");
+        logToTerminal("IRC DEBUG:   timestamp: " ~ chat.timestamp, "DEBUG", "irc");
+        logToTerminal("IRC DEBUG:   rawNick: " ~ chat.rawNick, "DEBUG", "irc");
+        logToTerminal("IRC DEBUG:   prefix: '" ~ chat.prefix ~ "' (length: " ~ to!string(chat.prefix.length) ~ ")", "DEBUG", "irc");
+        if (chat.prefix.length > 0) {
+            logToTerminal("IRC DEBUG:   prefix[0]: '" ~ [chat.prefix[0]] ~ "' (hex: 0x" ~ format("%02x", chat.prefix[0]) ~ ")", "DEBUG", "irc");
+        }
+        logToTerminal("IRC DEBUG:   messageType: " ~ chat.messageType, "DEBUG", "irc");
+        logToTerminal("IRC DEBUG:   body: " ~ chat.body, "DEBUG", "irc");
+
+        sendToGui(IrcToGtkMessage.fromChat(chat));
+
+        string displayNick = prefixStr.length > 0 ? prefixStr ~ rawNickname : rawNickname;
+        string logPrefix = channel.length > 0 ? "[" ~ channel ~ "]" : "[" ~ serverName ~ "]";
+        string logMsg = logPrefix ~ " " ~ displayNick ~ (isAction ? " " : ": ") ~ msgBody;
+        logToTerminal(logMsg, "INFO", "irc");
+    }
+
+    private void sendChannelUpdate(string channel, string action) {
+        logToTerminal("IRC DEBUG: Sending channel update: " ~ channel ~ " - " ~ action, "DEBUG", "irc");
+        ChannelUpdate update = ChannelUpdate(serverName, channel, action);
+        sendToGui(IrcToGtkMessage.fromUpdate(update));
+    }
+
+    private void sendSystemMessage(string text) {
+        logToTerminal("IRC DEBUG: Sending system message: " ~ text, "DEBUG", "irc");
+        sendToGui(IrcToGtkMessage.fromSystem(text));
+    }
+
+    private void sendTopicMessage(string channel, string topic) {
+        logToTerminal("IRC DEBUG: Sending topic message: " ~ channel ~ " - " ~ topic, "DEBUG", "irc");
+        sendToGui(IrcToGtkMessage.fromTopic(ChannelTopic(serverName, channel, topic)));
+    }
+
+    override void onChannelMessage(Message fullMessage, string channel, string msgBody) {
+        logToTerminal("IRC DEBUG: ========== onChannelMessage CALLED ==========", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: channel param: '" ~ channel ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: msgBody param: '" ~ msgBody ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Full message toString: " ~ fullMessage.toString(), "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Message command: " ~ fullMessage.getCommand(), "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Message params: '" ~ fullMessage.getParams() ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Message trailing: '" ~ fullMessage.getTrailing() ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Message from: '" ~ fullMessage.getFrom() ~ "'", "DEBUG", "irc");
+
+        if (channel.length > 0 && channel[0] == ':') {
+            channel = channel[1..$];
+        }
+
+        string sender = fullMessage.getFrom();
+        string nickname = sender;
+        auto exclamation = sender.indexOf("!");
+        if (exclamation != -1) {
+            nickname = sender[0..exclamation];
+        }
+
+        logToTerminal("IRC DEBUG: onChannelMessage - raw nickname from server: '" ~ nickname ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Is this our own message? " ~ (nickname == defaultNick ? "YES" : "NO"), "DEBUG", "irc");
+
+        string actualNickname = nickname;
+        string prefixFromMessage = "";
+        if (nickname.length > 0 && (nickname[0] == '@' || nickname[0] == '+' ||
+            nickname[0] == '%' || nickname[0] == '&' || nickname[0] == '~')) {
+            prefixFromMessage = [nickname[0]].idup;
+            actualNickname = nickname[1..$];
+            logToTerminal("IRC DEBUG: Detected prefix in nickname: '" ~ nickname ~ "' -> actual: '" ~ actualNickname ~ "'", "DEBUG", "irc");
+            if (channel.length > 0 && channel[0] == '#') {
+                char prefixChar = nickname[0];
+                string[] params = [actualNickname];
+                tracker.onMode(channel, "+" ~ [prefixChar].idup, params);
+                logToTerminal("Detected mode prefix in message for " ~ actualNickname ~ ": " ~ prefixFromMessage, "DEBUG", "irc");
+            }
+        }
+
+        bool isAction = false;
+        if (msgBody.length > 0 && msgBody[0] == '\x01' && msgBody.endsWith("\x01")) {
+            if (msgBody.length >= 8 && msgBody[1..8] == "ACTION ") {
+                isAction = true;
+                msgBody = msgBody[8..msgBody.length-1];
+            }
+        }
+
+        sendChatMessage(channel, actualNickname, msgBody, isAction);
+        logToTerminal("IRC DEBUG: ========== onChannelMessage END ==========", "DEBUG", "irc");
+    }
+
+    override void onDirectMessage(Message fullMessage, string nickname, string msgBody) {
+        logToTerminal("IRC DEBUG: ========== onDirectMessage CALLED ==========", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: nickname param: '" ~ nickname ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: msgBody param: '" ~ msgBody ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Full message toString: " ~ fullMessage.toString(), "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Message command: " ~ fullMessage.getCommand(), "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Message params: '" ~ fullMessage.getParams() ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Message trailing: '" ~ fullMessage.getTrailing() ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Message from: '" ~ fullMessage.getFrom() ~ "'", "DEBUG", "irc");
+        
+        bool isAction = false;
+        if (msgBody.length > 0 && msgBody[0] == '\x01' && msgBody.endsWith("\x01")) {
+            if (msgBody.length >= 8 && msgBody[1..8] == "ACTION ") {
+                isAction = true;
+                msgBody = msgBody[8..msgBody.length-1];
+            }
+        }
+        
+        sendChatMessage("", nickname, msgBody, isAction);
+        logToTerminal("IRC DEBUG: ========== onDirectMessage END ==========", "DEBUG", "irc");
+    }
+
+    void onNoticeMessage(Message fullMessage, string target, string msgBody) {
+        logToTerminal("IRC DEBUG: ========== onNoticeMessage CALLED ==========", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: target: '" ~ target ~ "', msgBody: '" ~ msgBody ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Full message toString: " ~ fullMessage.toString(), "DEBUG", "irc");
+        
+        string sender = fullMessage.getFrom();
+        string nickname = sender;
+        auto exclamation = sender.indexOf("!");
+        if (exclamation != -1) {
+            nickname = sender[0..exclamation];
+        }
+
+        string channel = target;
+        if (channel.length > 0 && channel[0] == ':') {
+            channel = channel[1..$];
+        }
+        
+        sendChatMessage(channel, nickname, msgBody, false, true);
+        logToTerminal("IRC DEBUG: ========== onNoticeMessage END ==========", "DEBUG", "irc");
+    }
+
+    override void onGenericCommand(Message message) {
+        logToTerminal("IRC DEBUG: ========== onGenericCommand CALLED ==========", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Message command: '" ~ message.getCommand() ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Message params: '" ~ message.getParams() ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Message trailing: '" ~ message.getTrailing() ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Message from: '" ~ message.getFrom() ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Full message toString: " ~ message.toString(), "DEBUG", "irc");
+
+        string cmd = message.getCommand();
+        string params = message.getParams();
+        string trailing = message.getTrailing();
+
+        if (cmd == "PRIVMSG") {
+            logToTerminal("IRC DEBUG: PRIVMSG detected in onGenericCommand!", "DEBUG", "irc");
+            logToTerminal("IRC DEBUG: This should have gone to onChannelMessage or onDirectMessage", "DEBUG", "irc");
+            logToTerminal("IRC DEBUG: Something is wrong with the birchwood library!", "ERROR", "irc");
+        }
+
+        if (cmd == "JOIN") {
+            string channel = params;
+            if (channel.length > 0 && channel[0] == ':') {
+                channel = channel[1..$];
+            }
+
+            string sender = message.getFrom();
+            string nickname = sender;
+            auto exclamation = sender.indexOf("!");
+            if (exclamation != -1) {
+                nickname = sender[0..exclamation];
+            }
+            
+            logToTerminal("IRC DEBUG: JOIN - raw nickname: '" ~ nickname ~ "'", "DEBUG", "irc");
+            logToTerminal("IRC DEBUG: JOIN channel: '" ~ channel ~ "'", "DEBUG", "irc");
+            
+            string actualNickname = nickname;
+            if (nickname.length > 0 && (nickname[0] == '@' || nickname[0] == '+' ||
+                nickname[0] == '%' || nickname[0] == '&' || nickname[0] == '~')) {
+                actualNickname = nickname[1..$];
+                char prefixChar = nickname[0];
+                string[] modeParams = [actualNickname];
+                tracker.onMode(channel, "+" ~ [prefixChar].idup, modeParams);
+                logToTerminal("IRC DEBUG: Detected prefix '" ~ [nickname[0]] ~ "' in JOIN for '" ~ actualNickname ~ "'", "DEBUG", "irc");
+                logToTerminal("Detected mode prefix in JOIN for " ~ actualNickname ~ ": " ~ nickname[0], "DEBUG", "irc");
+            }
+            
+            logToTerminal(actualNickname ~ " joined " ~ channel, "INFO", "irc");
+            
+            tracker.onJoin(channel, actualNickname);
+            
+            if (actualNickname == defaultNick) {
+                sendSystemMessage("Successfully joined " ~ channel);
+                sendChannelUpdate(channel, "join");
+            } else {
+                sendChatMessage(channel, actualNickname, "joined the channel", false, false, "join");
+            }
+        }
+        else if (cmd == "PART") {
+            string channel = params;
+            if (channel.length > 0 && channel[0] == ':') {
+                channel = channel[1..$];
+            }
+            
+            string sender = message.getFrom();
+            string nickname = sender;
+            auto exclamation = sender.indexOf("!");
+            if (exclamation != -1) {
+                nickname = sender[0..exclamation];
+            }
+            
+            string actualNickname = nickname;
+            if (nickname.length > 0 && (nickname[0] == '@' || nickname[0] == '+' ||
+                nickname[0] == '%' || nickname[0] == '&' || nickname[0] == '~')) {
+                actualNickname = nickname[1..$];
+            }
+
+            string partMsg = trailing.length > 0 ? trailing : "";
+            logToTerminal(actualNickname ~ " left " ~ channel, "INFO", "irc");
+            
+            tracker.onPart(channel, actualNickname);
+
+            if (actualNickname == defaultNick) {
+                sendChannelUpdate(channel, "part");
+            } else {
+                string msgText = "left the channel";
+                if (partMsg.length > 0) {
+                    msgText ~= " (" ~ partMsg ~ ")";
+                }
+                sendChatMessage(channel, actualNickname, msgText, false, false, "part");
+            }
+        }
+        else if (cmd == "QUIT") {
+            string sender = message.getFrom();
+            string nickname = sender;
+            auto exclamation = sender.indexOf("!");
+            if (exclamation != -1) {
+                nickname = sender[0..exclamation];
+            }
+
+            string actualNickname = nickname;
+            if (nickname.length > 0 && (nickname[0] == '@' || nickname[0] == '+' ||
+                nickname[0] == '%' || nickname[0] == '&' || nickname[0] == '~')) {
+                actualNickname = nickname[1..$];
+            }
+            
+            string quitMsg = trailing.length > 0 ? trailing : "";
+            logToTerminal(actualNickname ~ " quit: " ~ quitMsg, "INFO", "irc");
+            
+            tracker.onQuit(actualNickname);
+
+            string msgText = "quit";
+            if (quitMsg.length > 0) {
+                msgText ~= ": " ~ quitMsg;
+            }
+            sendChatMessage("", actualNickname, msgText, false, false, "quit");
+        }
+        else if (cmd == "NICK") {
+            string sender = message.getFrom();
+            string oldNick = sender;
+            auto exclamation = sender.indexOf("!");
+            if (exclamation != -1) {
+                oldNick = sender[0..exclamation];
+            }
+
+            string actualOldNick = oldNick;
+            if (oldNick.length > 0 && (oldNick[0] == '@' || oldNick[0] == '+' ||
+                oldNick[0] == '%' || oldNick[0] == '&' || oldNick[0] == '~')) {
+                actualOldNick = oldNick[1..$];
+            }
+            
+            string newNick = trailing;
+            if (newNick.length > 0 && newNick[0] == ':') {
+                newNick = newNick[1..$];
+            }
+
+            logToTerminal(actualOldNick ~ " is now known as " ~ newNick, "INFO", "irc");
+
+            tracker.onNickChange(actualOldNick, newNick);
+
+            sendChatMessage("", actualOldNick, "is now known as " ~ newNick, false, false, "nick");
+        }
+        else if (cmd == "MODE") {
+            logToTerminal("IRC DEBUG: MODE command received - params: '" ~ params ~ "', trailing: '" ~ trailing ~ "'", "DEBUG", "irc");
+            
+            auto parts = params.split(" ");
+            if (parts.length >= 2) {
+                string target = parts[0];
+                if (target.length > 0 && target[0] == '#') {
+                    string channel = target;
+                    string modeStr = parts[1];
+                    
+                    string[] modeParams;
+                    if (parts.length > 2) {
+                        modeParams = parts[2..$];
+                    }
+
+                    if (trailing.length > 0 && modeParams.length == 0) {
+                        modeParams = [trailing];
+                    } else if (trailing.length > 0) {
+                        modeParams ~= trailing;
+                    }
+                    
+                    foreach (ref param; modeParams) {
+                        if (param.length > 0 && param[0] == ':') {
+                            param = param[1..$];
+                        }
+                    }
+                    
+                    logToTerminal("IRC DEBUG: MODE command for " ~ channel ~ ": " ~ modeStr ~ " params: " ~ (modeParams.length > 0 ? modeParams.join(" ") : "none"), "DEBUG", "irc");
+
+                    tracker.onMode(channel, modeStr, modeParams);
+                }
+            }
+        }
+        
+        logToTerminal("IRC DEBUG: ========== onGenericCommand END ==========", "DEBUG", "irc");
+    }
+
+    override void onCommandReply(Message commandReply) {
+        logToTerminal("IRC DEBUG: ========== onCommandReply CALLED ==========", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Reply command: '" ~ commandReply.getCommand() ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Reply params: '" ~ commandReply.getParams() ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Reply trailing: '" ~ commandReply.getTrailing() ~ "'", "DEBUG", "irc");
+        logToTerminal("IRC DEBUG: Full reply toString: " ~ commandReply.toString(), "DEBUG", "irc");
+        
+        string cmd = commandReply.getCommand();
+        string params = commandReply.getParams();
+        string trailing = commandReply.getTrailing();
+
+        try {
+            int replyCode = to!int(cmd);
+
+            if (replyCode == 001) {
+                logToTerminal("Connected to server", "INFO", "irc");
+                sendSystemMessage("Connected to " ~ serverName);
+                tracker.setSelfUser(defaultNick);
+            }
+            else if (replyCode == 332) {
+                auto parts = params.split(" ");
+                if (parts.length >= 3) {
+                    string channel = parts[1];
+                    if (channel.length > 0 && channel[0] == ':') {
+                        channel = channel[1..$];
+                    }
+                    string topic = trailing;
+                    if (topic.length > 0 && topic[0] == ':') {
+                        topic = topic[1..$];
+                    }
+                    sendTopicMessage(channel, topic);
+                    logToTerminal("Topic for " ~ channel ~ ": " ~ topic, "INFO", "irc");
+                }
+            }
+            else if (replyCode == 333) {
+                auto parts = params.split(" ");
+                if (parts.length >= 4) {
+                    string channel = parts[1];
+                    if (channel.length > 0 && channel[0] == ':') {
+                        channel = channel[1..$];
+                    }
+                    string setter = parts[2];
+                    string timestamp = parts[3];
+                    logToTerminal("Topic for " ~ channel ~ " set by " ~ setter ~ " at " ~ timestamp, "INFO", "irc");
+                }
+            }
+            else if (replyCode == 353) {
+                auto parts = params.split(" ");
+                if (parts.length >= 3) {
+                    string channel = parts[2];
+                    if (channel.length > 0 && channel[0] == ':') {
+                        channel = channel[1..$];
+                    }
+                    
+                    auto names = trailing.split(" ");
+                    logToTerminal("IRC DEBUG: NAMES reply for " ~ channel ~ " - raw names: " ~ to!string(names.length) ~ " users", "DEBUG", "irc");
+                    
+                    tracker.onNames(channel, names);
+                    
+                    logToTerminal("Processed NAMES for " ~ channel ~ " (" ~ to!string(names.length) ~ " users)", "DEBUG", "irc");
+                }
+            }
+            else if (replyCode == 366) {
+                logToTerminal("End of NAMES list", "DEBUG", "irc");
+            }
+            else {
+                logToTerminal("Server reply " ~ cmd ~ ": " ~ trailing, "DEBUG", "irc");
+                
+                if (trailing.length > 0 && replyCode != 353 && replyCode != 366) {
+                    sendSystemMessage(trailing);
+                }
+            }
+        } catch (Exception e) {
+            logToTerminal("Ignoring unsupported reply code: " ~ cmd, "DEBUG", "irc");
+            if (trailing.length > 0) {
+                sendSystemMessage(trailing);
+            }
+        }
+        logToTerminal("IRC DEBUG: ========== onCommandReply END ==========", "DEBUG", "irc");
+    }
+
+    override void onConnectionClosed() {
+        logToTerminal("IRC DEBUG: ========== onConnectionClosed CALLED ==========", "DEBUG", "irc");
+        logToTerminal("Connection to " ~ serverName ~ " closed", "INFO", "irc");
+
+        sendChannelUpdate("", "failed");
+        clientRunning = false;
+        if (tracker) {
+            tracker.stop();
+        }
+        logToTerminal("IRC DEBUG: ========== onConnectionClosed END ==========", "DEBUG", "irc");
+    }
+}
+
+void runIrcServer(string server, Tid gtkTid, int pipeFd) {
+    logToTerminal("Creating IRC client for " ~ server, "INFO", "irc");
+    
+    try {
+        auto client = new MyIRCClient(server, gtkTid, pipeFd);
+        client.connect();
+        logToTerminal("IRC client connected, waiting for commands...", "INFO", "irc");
+
+        bool running = true;
+        while (running && client.clientRunning) {
+            bool gotCommand = false;
+            bool shouldQuit = false;
+            do {
+                gotCommand = receiveTimeout(Duration.zero,
+                    (IrcFromGtkMessage msg) {
+                        try {
+                            if (msg.type == IrcFromGtkMessage.Type.Message && msg.text.length > 0) {
+                                if (msg.channel.length > 0 && msg.channel[0] == '#') {
+                                    logToTerminal("IRC DEBUG: Sending message to channel " ~ msg.channel ~ ": " ~ msg.text, "DEBUG", "irc");
+                                    bool isAction = false;
+                                    string displayText = msg.text;
+                                    if (msg.text.length > 0 && msg.text[0] == '\x01' && msg.text.endsWith("\x01")) {
+                                        if (msg.text.length >= 8 && msg.text[1..8] == "ACTION ") {
+                                            isAction = true;
+                                            displayText = msg.text[8..msg.text.length-1];
+                                            logToTerminal("IRC DEBUG: Detected ACTION message: " ~ displayText, "DEBUG", "irc");
+                                        }
+                                    }
+
+                                    logToTerminal("IRC DEBUG: Displaying own message immediately: " ~ displayText, "DEBUG", "irc");
+                                    client.sendChatMessage(msg.channel, defaultNick, displayText, isAction, false, isAction ? "action" : "message");
+
+                                    client.channelMessage(msg.text, msg.channel);
+                                    logToTerminal("Sent to " ~ msg.channel ~ ": " ~ msg.text, "INFO", "irc");
+                                } else if (msg.channel.length > 0 && msg.channel[0] != '#') {
+                                    logToTerminal("IRC DEBUG: Sending direct message to " ~ msg.channel ~ ": " ~ msg.text, "DEBUG", "irc");
+                                    
+                                    bool isAction = false;
+                                    string displayText = msg.text;
+                                    if (msg.text.length > 0 && msg.text[0] == '\x01' && msg.text.endsWith("\x01")) {
+                                        if (msg.text.length >= 8 && msg.text[1..8] == "ACTION ") {
+                                            isAction = true;
+                                            displayText = msg.text[8..msg.text.length-1];
+                                            logToTerminal("IRC DEBUG: Detected ACTION message in PM: " ~ displayText, "DEBUG", "irc");
+                                        }
+                                    }
+
+                                    logToTerminal("IRC DEBUG: Displaying own PM immediately to " ~ msg.channel ~ ": " ~ displayText, "DEBUG", "irc");
+                                    string pmText = isAction ? displayText : ("To " ~ msg.channel ~ ": " ~ displayText);
+                                    client.sendChatMessage("", defaultNick, pmText, isAction, false, isAction ? "action" : "message");
+
+                                    client.directMessage(msg.text, msg.channel);
+                                    logToTerminal("Sent PM to " ~ msg.channel ~ ": " ~ msg.text, "INFO", "irc");
+                                } else {
+                                    auto spacePos = msg.text.indexOf(" ");
+                                    string command;
+                                    string params;
+                                    if (spacePos != -1) {
+                                        command = msg.text[0..spacePos];
+                                        params = msg.text[spacePos+1..$];
+                                    } else {
+                                        command = msg.text;
+                                        params = "";
+                                    }
+                                    auto rawMessage = new Message("", command, params);
+                                    
+                                    client.command(rawMessage);
+                                    logToTerminal("Sent raw command: " ~ msg.text, "INFO", "irc");
+                                }
+                            } else if (msg.type == IrcFromGtkMessage.Type.UpdateChannels) {
+                                if (msg.action == "join" && msg.channel.length > 0) {
+                                    client.joinChannel(msg.channel);
+                                    logToTerminal("Joining " ~ msg.channel, "INFO", "irc");
+                                } else if (msg.action == "part" && msg.channel.length > 0) {
+                                    client.leaveChannel(msg.channel);
+                                    logToTerminal("Leaving " ~ msg.channel, "INFO", "irc");
+                                } else if (msg.action == "quit") {
+                                    logToTerminal("Quitting IRC", "INFO", "irc");
+                                    try {
+                                        client.quit();
+                                    } catch (Exception e) {
+                                        logToTerminal("Error during quit: " ~ e.msg, "DEBUG", "irc");
+                                    }
+                                    running = false;
+                                    shouldQuit = true;
+                                }
+                            }
+                        } catch (Exception e) {
+                            logToTerminal("Error: " ~ e.msg, "ERROR", "irc");
+                            // Send internal error
+                            client.sendSystemMessage("Error: " ~ e.msg);
+                        }
+                        return true;
+                    }
+                );
+            } while (gotCommand && !shouldQuit);
+
+            if (shouldQuit) {
+                break;
+            }
+            
+            Thread.sleep(10.msecs);
+        }
+        
+        logToTerminal("IRC client thread exiting", "INFO", "irc");
+    } catch (Exception e) {
+        logToTerminal("Error: " ~ e.msg, "ERROR", "irc");
+        // Send connection error
+        send(gtkTid, IrcToGtkMessage.fromSystem("Connection error: " ~ e.msg));
+    }
+}
