@@ -1,0 +1,8 @@
+{
+	"fileVersion": 1,
+	"versions": {
+		"dirk": "0.2.0",
+		"gid": "0.9.7",
+		"openssl": "3.4.0"
+	}
+}
